@@ -1,0 +1,28 @@
+# 安全文件
+secret_key.txt
+database.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+temp/
+
