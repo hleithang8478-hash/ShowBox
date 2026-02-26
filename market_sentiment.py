@@ -23,7 +23,7 @@ from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
-SENTIMENT_VERSION = 'v2'
+SENTIMENT_VERSION = 'v3'
 
 # ─── 常量 ────────────────────────────────────────────
 LIMIT_THRESHOLD = 0.098
@@ -63,8 +63,9 @@ PENALTY_ALL_BELOW_MA60 = 30
 STYLE_DIFF_THRESHOLD = -0.02
 PENALTY_STYLE_DIFF = 20
 FACTOR_QUINTILE = 0.2        # 分组用 20% 分位
-FACTOR_SPREAD_THRESH = -0.015  # 连续3日 spread < -1.5%
+FACTOR_SPREAD_THRESH = -0.015  # 单日 spread 阈值
 FACTOR_CONSEC_DAYS = 3
+FACTOR_CUM_SPREAD_THRESH = -0.03  # 3日累计 spread < -3% 触发
 PENALTY_SIZE_FACTOR = 20
 PENALTY_VOL_FACTOR = 15
 FACTOR_VOL_WINDOW = 20       # 20日滚动波动率
@@ -78,7 +79,7 @@ PENALTY_HOT_AVG = 20
 PENALTY_HOT_NUKE = 20
 
 # Module 7: 聪明钱
-SMART_DISTRIB_THRESHOLD = 0.60   # 高开低走成交额占比 > 60%
+SMART_DISTRIB_THRESHOLD = 0.60   # 诱多派发成交额占比 > 60%
 PENALTY_SMART_DISTRIB = 15
 TURNOVER_TOP_PCT = 0.10          # 换手率前10%
 TURNOVER_PREMIUM_THRESH = -0.02  # 活跃池收益 < -2%
@@ -242,7 +243,10 @@ def module1_market_breadth(daily_df: pd.DataFrame, trading_day: str) -> Dict[str
     mfr = round(float(mfr), 4) if mfr is not None and np.isfinite(mfr) else None
     mvfr = today.get('mv_flow_ratio', None)
     mvfr = round(float(mvfr), 4) if mvfr is not None and np.isfinite(mvfr) else None
-    divergence = round(mfr - mvfr, 4) if mfr is not None and mvfr is not None else None
+    if mfr is not None and mvfr is not None and mfr > 0 and mvfr > 0:
+        divergence = round(float(np.log(mfr) - np.log(mvfr)), 4)
+    else:
+        divergence = None
 
     penalty = 0
     penalty_detail = []
@@ -305,13 +309,15 @@ def module2_liquidity(
 # ─── 模块 3（改造一：加权横截面离散度 WCSV）─────────
 
 def _weighted_cross_sectional_std(df_day: pd.DataFrame) -> float:
-    """成交额加权的横截面收益率标准差。"""
+    """sqrt(成交额) 加权的横截面收益率标准差。
+    用 sqrt 降低超大盘股的寡头效应，让中小盘波动信号不被淹没。"""
     r = df_day['R'].values
-    w = df_day['Amount'].values if 'Amount' in df_day.columns else np.ones(len(r))
-    mask = np.isfinite(r) & np.isfinite(w) & (w > 0)
-    r, w = r[mask], w[mask]
+    raw_w = df_day['Amount'].values if 'Amount' in df_day.columns else np.ones(len(r))
+    mask = np.isfinite(r) & np.isfinite(raw_w) & (raw_w > 0)
+    r, raw_w = r[mask], raw_w[mask]
     if len(r) < 10:
         return np.nan
+    w = np.sqrt(raw_w)
     w_norm = w / w.sum()
     mean_r = np.average(r, weights=w_norm)
     return float(np.sqrt(np.average((r - mean_r) ** 2, weights=w_norm)))
@@ -471,6 +477,7 @@ def module5_style_factors(
             spread_size = round(float(r_small - r_large), 6)
 
     size_consec = 0
+    size_cum3 = None
     if spread_size is not None and size_spread_history:
         recent = list(size_spread_history) + [spread_size]
         for v in reversed(recent):
@@ -478,10 +485,13 @@ def module5_style_factors(
                 size_consec += 1
             else:
                 break
-    if size_consec >= FACTOR_CONSEC_DAYS:
+        tail3 = [v for v in recent[-FACTOR_CONSEC_DAYS:] if v is not None]
+        if len(tail3) == FACTOR_CONSEC_DAYS:
+            size_cum3 = sum(tail3)
+    if size_cum3 is not None and size_cum3 < FACTOR_CUM_SPREAD_THRESH:
         penalty += PENALTY_SIZE_FACTOR
         detail.append(
-            f'Size Factor连续{size_consec}日<{FACTOR_SPREAD_THRESH:.1%}（弃小买大抽血），扣{PENALTY_SIZE_FACTOR}分')
+            f'Size Factor近{FACTOR_CONSEC_DAYS}日累计{size_cum3:.2%}<{FACTOR_CUM_SPREAD_THRESH:.0%}（小盘累计被抽血），扣{PENALTY_SIZE_FACTOR}分')
 
     # --- Volatility Factor ---
     spread_vol = None
@@ -494,6 +504,7 @@ def module5_style_factors(
             spread_vol = round(float(r_high_vol - r_low_vol), 6)
 
     vol_consec = 0
+    vol_cum3 = None
     if spread_vol is not None and vol_spread_history:
         recent = list(vol_spread_history) + [spread_vol]
         for v in reversed(recent):
@@ -501,10 +512,13 @@ def module5_style_factors(
                 vol_consec += 1
             else:
                 break
-    if vol_consec >= FACTOR_CONSEC_DAYS:
+        tail3 = [v for v in recent[-FACTOR_CONSEC_DAYS:] if v is not None]
+        if len(tail3) == FACTOR_CONSEC_DAYS:
+            vol_cum3 = sum(tail3)
+    if vol_cum3 is not None and vol_cum3 < FACTOR_CUM_SPREAD_THRESH:
         penalty += PENALTY_VOL_FACTOR
         detail.append(
-            f'Vol Factor连续{vol_consec}日<{FACTOR_SPREAD_THRESH:.1%}（高波被闷杀/风险偏好收缩），扣{PENALTY_VOL_FACTOR}分')
+            f'Vol Factor近{FACTOR_CONSEC_DAYS}日累计{vol_cum3:.2%}<{FACTOR_CUM_SPREAD_THRESH:.0%}（高波累计被闷杀），扣{PENALTY_VOL_FACTOR}分')
 
     # --- CSI1000 vs SH50 (保留) ---
     r_csi1000_vs_sh50 = None
@@ -553,7 +567,25 @@ def module6_hot_money(df_2: pd.DataFrame, yesterday: str, today: str) -> Dict[st
             'nuke_count': 0, 'nuke_ratio': None,
             'penalty': 0, 'penalty_detail': [], 'error': '缺少昨日或今日数据'
         }
-    hot_codes = set(df_y.loc[df_y['R'] > LIMIT_THRESHOLD, 'SecuCode'])
+    # 动态涨停阈值：根据代码前缀区分板块 + Close==High 兜底
+    dy = df_y.copy()
+    for _c in ['Close', 'High', 'Open']:
+        if _c in dy.columns:
+            dy[_c] = pd.to_numeric(dy[_c], errors='coerce')
+    _thresholds = pd.Series(0.095, index=dy.index)
+    if 'SecuCode' in dy.columns:
+        _is_kc_cy = dy['SecuCode'].astype(str).str.match(r'^(688|300)')
+        _is_bj = dy['SecuCode'].astype(str).str.match(r'^[84]')
+        _thresholds[_is_kc_cy] = 0.195
+        _thresholds[_is_bj] = 0.295
+    if 'SecuAbbr' in dy.columns:
+        _is_st = dy['SecuAbbr'].astype(str).str.contains('ST', na=False)
+        _thresholds[_is_st] = 0.048
+    _has_hc = 'Close' in dy.columns and 'High' in dy.columns
+    _is_limit_up = (dy['R'] > _thresholds)
+    if _has_hc:
+        _is_limit_up = _is_limit_up & (dy['Close'] == dy['High'])
+    hot_codes = set(dy.loc[_is_limit_up, 'SecuCode'])
     if not hot_codes:
         return {
             'hot_avg_return': None, 'hot_count': 0,
@@ -615,29 +647,37 @@ def module7_smart_money(
     penalty = 0
     detail: List[str] = []
 
-    # --- Smart Distribution: 高开低走的成交额加权占比 ---
+    # --- Smart Distribution: 诱多派发（高开+盘中拉升+收阴）的成交额加权占比 ---
     smart_ratio = None
     count_ratio = None
-    has_oc = 'Open' in d.columns and 'Close' in d.columns
+    need_cols = ['Open', 'Close', 'High']
+    has_oc = all(c in d.columns for c in need_cols)
+    has_pc = 'PreClose' in d.columns
     has_amt = 'Amount' in d.columns
     if has_oc:
-        mask = d['Open'].notna() & d['Close'].notna()
+        mask = d['Open'].notna() & d['Close'].notna() & d['High'].notna()
+        if has_pc:
+            mask = mask & d['PreClose'].notna()
+            d['PreClose'] = pd.to_numeric(d['PreClose'], errors='coerce')
         dm = d[mask]
         total = len(dm)
-        is_fg = dm['Close'] < dm['Open']
-        count_fg = int(is_fg.sum())
+        # 诱多派发三条件：高开 + 盘中拉升（High > Open）+ 最终收阴（Close < Open）
+        is_bull_trap = (dm['High'] > dm['Open']) & (dm['Close'] < dm['Open'])
+        if has_pc:
+            is_bull_trap = is_bull_trap & (dm['Open'] > dm['PreClose'])
+        count_fg = int(is_bull_trap.sum())
         count_ratio = round(count_fg / total, 4) if total > 0 else None
 
         if has_amt and total > 0:
             total_amount = dm['Amount'].sum()
-            fg_amount = dm.loc[is_fg, 'Amount'].sum()
+            fg_amount = dm.loc[is_bull_trap, 'Amount'].sum()
             smart_ratio = round(float(fg_amount / total_amount), 4) if total_amount > 0 else None
 
         if smart_ratio is not None and smart_ratio > SMART_DISTRIB_THRESHOLD:
             penalty += PENALTY_SMART_DISTRIB
             detail.append(
-                f'高开低走股票吸收了{smart_ratio:.1%}的全市场成交额（>{SMART_DISTRIB_THRESHOLD:.0%}），'
-                f'活跃资金被套/主力派发，扣{PENALTY_SMART_DISTRIB}分')
+                f'诱多派发（高开拉升收阴）股票吸收了{smart_ratio:.1%}的成交额（>{SMART_DISTRIB_THRESHOLD:.0%}），'
+                f'主力拉高出货，扣{PENALTY_SMART_DISTRIB}分')
 
     # --- Turnover Premium: 高换手率前10%股票的平均收益 ---
     top_ret = None
