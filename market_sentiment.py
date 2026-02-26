@@ -104,6 +104,21 @@ def _filter_universe(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+# ─── 动态涨跌停阈值（区分主板/双创/北交/ST）──────────
+
+def _get_dynamic_limit_thresholds(df: pd.DataFrame) -> pd.Series:
+    """根据代码前缀和名称返回每只股票的涨跌停阈值 (正数)。
+    主板 0.095, 创业板/科创板 0.195, 北交所 0.295, ST 0.048。"""
+    thresholds = pd.Series(0.095, index=df.index)
+    if 'SecuCode' in df.columns:
+        code = df['SecuCode'].astype(str)
+        thresholds[code.str.match(r'^(688|300)')] = 0.195
+        thresholds[code.str.match(r'^[84]')] = 0.295
+    if 'SecuAbbr' in df.columns:
+        thresholds[df['SecuAbbr'].astype(str).str.contains('ST', na=False)] = 0.048
+    return thresholds
+
+
 # ─── 向量化辅助（改造一：成交额加权）──────────────────
 
 def _vectorized_daily_breadth(df: pd.DataFrame) -> pd.DataFrame:
@@ -128,8 +143,9 @@ def _vectorized_daily_breadth(df: pd.DataFrame) -> pd.DataFrame:
 
     d['_up'] = d['R'] > 0
     d['_down'] = d['R'] < 0
-    d['_limit_up'] = d['R'] > LIMIT_THRESHOLD
-    d['_limit_down'] = d['R'] < -LIMIT_THRESHOLD
+    _dyn_thresh = _get_dynamic_limit_thresholds(d)
+    d['_limit_up'] = d['R'] > _dyn_thresh
+    d['_limit_down'] = d['R'] < -_dyn_thresh
 
     if has_amount:
         d['_amt_up'] = d['Amount'] * d['_up'].astype(float)
@@ -171,9 +187,10 @@ def _vectorized_daily_breadth(df: pd.DataFrame) -> pd.DataFrame:
         d2 = d2.assign(
             _one_word=(d2['Open'] == d2['High']) & (d2['High'] == d2['Low']) & (d2['Low'] == d2['Close']),
         )
+        _dyn2 = _dyn_thresh.reindex(d2.index)
         d2 = d2.assign(
-            _owld=d2['_one_word'] & (d2['R'] < -LIMIT_THRESHOLD),
-            _owlu=d2['_one_word'] & (d2['R'] > LIMIT_THRESHOLD),
+            _owld=d2['_one_word'] & (d2['R'] < -_dyn2),
+            _owlu=d2['_one_word'] & (d2['R'] > _dyn2),
         )
         ow = d2.groupby('Date').agg(
             one_word_limit_down=('_owld', 'sum'),
@@ -601,7 +618,8 @@ def module6_hot_money(df_2: pd.DataFrame, yesterday: str, today: str) -> Dict[st
             'penalty': 0, 'penalty_detail': [], 'error': '昨日涨停股今日无行情'
         }
     hot_avg = float(df_t_hot['R'].mean())
-    nuke_count = int((df_t_hot['R'] < -LIMIT_THRESHOLD).sum())
+    _nuke_thresh = _get_dynamic_limit_thresholds(df_t_hot)
+    nuke_count = int((df_t_hot['R'] < -_nuke_thresh).sum())
     nuke_ratio = nuke_count / hot_count
     penalty = 0
     detail: List[str] = []
@@ -749,7 +767,10 @@ def module8_strong_stock_crash(
         return empty
 
     strong_avg = float(strong_today.mean())
-    limitdown_count = int((strong_today < -LIMIT_THRESHOLD).sum())
+    _strong_df = df_today_slice[df_today_slice['SecuCode'].isin(strong_codes)]
+    _strong_thresh = _get_dynamic_limit_thresholds(_strong_df)
+    _strong_thresh.index = _strong_df['SecuCode'].values
+    limitdown_count = int((strong_today < -_strong_thresh.reindex(strong_today.index).fillna(0.095)).sum())
 
     penalty = 0
     detail: List[str] = []
@@ -828,9 +849,14 @@ def compute_daily_sentiment(trading_day: str, fetcher) -> Dict[str, Any]:
         if 'ChangePCT' in df_idx_all.columns:
             df_idx_all['ChangePCT'] = pd.to_numeric(df_idx_all['ChangePCT'], errors='coerce')
         df_liq = df_idx_all[df_idx_all['InnerCode'].isin(index_inner_codes)]
-        base = df_liq[(df_liq['InnerCode'] == index_inner_codes[0]) & (df_liq['TradingDay'] == trading_day)]
-        if not base.empty and 'ChangePCT' in base.columns and not pd.isna(base['ChangePCT'].iloc[0]):
-            market_return_today = float(base['ChangePCT'].iloc[0]) / 100.0
+        # 综合判断：上证+深成指，任一下跌即视为大盘偏空
+        _idx_today = df_liq[df_liq['TradingDay'] == trading_day]
+        if not _idx_today.empty and 'ChangePCT' in _idx_today.columns:
+            _idx_pcts = _idx_today.set_index('InnerCode')['ChangePCT'].dropna()
+            if not _idx_pcts.empty:
+                _sh = float(_idx_pcts.get(1, 0)) / 100.0
+                _sz = float(_idx_pcts.get(1059, 0)) / 100.0
+                market_return_today = min(_sh, _sz)
         daily_total = df_liq.groupby('TradingDay')['TurnoverValue'].sum()
         daily_billion = (daily_total / 1e8).to_dict()
         turnover_today = float(daily_billion.get(trading_day, 0))
@@ -879,11 +905,11 @@ def compute_daily_sentiment(trading_day: str, fetcher) -> Dict[str, Any]:
     try:
         if df_252_ok:
             df_today_stocks = df_252[df_252['Date'] == trading_day].copy()
-            # 20日滚动波动率
-            vol20 = df_252.groupby('SecuCode')['R'].rolling(FACTOR_VOL_WINDOW, min_periods=10).std()
-            vol20 = vol20.reset_index(level=0, drop=True)
+            # 20日滚动波动率（shift(1) 用昨日波动率对今日分组，消除内生性）
+            vol20_raw = df_252.groupby('SecuCode')['R'].rolling(FACTOR_VOL_WINDOW, min_periods=10).std()
+            vol20_shifted = vol20_raw.groupby(level=0).shift(1)
             df_252_tmp = df_252.copy()
-            df_252_tmp['_vol20'] = vol20
+            df_252_tmp['_vol20'] = vol20_shifted.reset_index(level=0, drop=True)
             df_today_with_vol = df_252_tmp[df_252_tmp['Date'] == trading_day]
 
             # 最近几天的 spread history
@@ -1162,10 +1188,11 @@ def compute_batch_sentiment_streaming(
     sigma_w_by_date = df_all.groupby('Date').apply(_weighted_cross_sectional_std)
     sigma_e_by_date = df_all.groupby('Date')['R'].std()
 
-    # 风格因子 spread 预计算（向量化：merge 分位数替代逐日 for 循环）
-    vol20 = df_all.groupby('SecuCode')['R'].rolling(FACTOR_VOL_WINDOW, min_periods=10).std()
-    vol20 = vol20.reset_index(level=0, drop=True)
-    df_all['_vol20'] = vol20
+    # 风格因子 spread 预计算（向量化）
+    # shift(1) 剔除今日收益对今日分组的内生性干扰
+    vol20_raw = df_all.groupby('SecuCode')['R'].rolling(FACTOR_VOL_WINDOW, min_periods=10).std()
+    vol20_shifted = vol20_raw.groupby(level=0).shift(1)
+    df_all['_vol20'] = vol20_shifted.reset_index(level=0, drop=True)
 
     size_spread_by_date = {}
     vol_spread_by_date = {}
@@ -1397,9 +1424,13 @@ def _compute_single_day_from_cache(
         series_20 = [daily_turnover_billion.get(d, 0) for d in dates_20]
         series_252 = [daily_turnover_billion.get(d, 0) for d in dates_252]
         if df_idx_all is not None and not df_idx_all.empty:
-            base = df_idx_all[(df_idx_all['InnerCode'] == 1) & (df_idx_all['TradingDay'] == trading_day)]
-            if not base.empty and 'ChangePCT' in base.columns and not pd.isna(base['ChangePCT'].iloc[0]):
-                market_return_today = float(base['ChangePCT'].iloc[0]) / 100.0
+            _idx_td = df_idx_all[df_idx_all['TradingDay'] == trading_day]
+            if not _idx_td.empty and 'ChangePCT' in _idx_td.columns:
+                _ip = _idx_td.set_index('InnerCode')['ChangePCT'].dropna()
+                if not _ip.empty:
+                    _sh_r = float(_ip.get(1, 0)) / 100.0
+                    _sz_r = float(_ip.get(1059, 0)) / 100.0
+                    market_return_today = min(_sh_r, _sz_r)
         result['module2'] = module2_liquidity(turnover_today, series_5, series_20, turnover_series_252=series_252)
     else:
         result['module2'] = {'penalty': 0, 'penalty_detail': [], 'error': '无成交额数据'}

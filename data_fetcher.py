@@ -573,7 +573,8 @@ class JuyuanDataFetcher:
                 except Exception as e:
                     logger.error(f"[get_stock_list_parallel] {market_name}市场查询失败: {e}")
         
-        # 如果指定了limit，需要限制总数
+        # 按代码排序确保确定性和市场公平性，再截断
+        all_stock_info.sort(key=lambda x: x.get('code', ''))
         before_limit = len(all_stock_info)
         if limit != 99999 and len(all_stock_info) > limit:
             all_stock_info = all_stock_info[:limit]
