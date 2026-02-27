@@ -78,6 +78,15 @@ HOT_MIN_COUNT = 10
 PENALTY_HOT_AVG = 20
 PENALTY_HOT_NUKE = 20
 
+# 连续能量模型 (Continuous Energy Index)
+ENERGY_LOOKBACK_DAYS = 252         # Z-Score 参考窗口
+ENERGY_ROLL_MEAN_DAYS = 60         # 动态中性线窗口
+ENERGY_BASE_DECAY = 0.05           # 基础衰减
+ENERGY_CAP = 150.0                 # Cap 系数
+ENERGY_NEG_WEIGHT = 1.5            # 环境变差时的负向放大
+ENERGY_Z_THRESH = 2.0              # 异常 Z-Score 阈值
+ENERGY_MIN_HISTORY = 40            # 至少多少历史点再开始计算
+
 # Module 7: 聪明钱
 SMART_DISTRIB_THRESHOLD = 0.60   # 诱多派发成交额占比 > 60%
 PENALTY_SMART_DISTRIB = 15
@@ -1707,3 +1716,117 @@ def generate_sentiment_report(data: dict) -> str:
             L.append('系统性风险密集释放，极端恐慌环境，建议清仓等待右侧反转确认。')
 
     return '\n'.join(L)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  连续能量指数计算（Dynamic Anomaly Resonance + Energy Index）
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_energy_index_series(df_hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    基于历史截面结果，计算连续能量指数。
+    输入 df_hist 需包含列：
+      - trading_day: str
+      - total_score: float
+      - m1_mfr: Module1 money_flow_ratio
+      - m2_turnover: Module2 turnover_today
+      - m6_nuke: Module6 nuke_ratio
+    返回 DataFrame，增加：
+      - energy_index: 连续能量指数 S_t
+      - energy_reset: 是否为冰点重置日
+    """
+    if df_hist is None or df_hist.empty:
+        return df_hist
+
+    df = df_hist.copy()
+    df = df.sort_values('trading_day')
+    df['trading_day'] = pd.to_datetime(df['trading_day'])
+
+    # 基础列转为 float
+    for col in ['total_score', 'm1_mfr', 'm2_turnover', 'm6_nuke']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 至少需要一定历史才有统计意义
+    if df['total_score'].notna().sum() < ENERGY_MIN_HISTORY:
+        df['energy_index'] = 0.0
+        df['energy_reset'] = False
+        return df
+
+    # 计算滚动均值/方差（向后 shift(1)，避免前视）
+    df = df.set_index('trading_day')
+
+    def _zscore(col: str) -> pd.Series:
+        x = df[col]
+        mean = x.rolling(ENERGY_LOOKBACK_DAYS, min_periods=ENERGY_MIN_HISTORY).mean().shift(1)
+        std = x.rolling(ENERGY_LOOKBACK_DAYS, min_periods=ENERGY_MIN_HISTORY).std().shift(1)
+        z = (x - mean) / std.replace(0, np.nan)
+        return z
+
+    z_m1 = _zscore('m1_mfr')
+    z_m2 = _zscore('m2_turnover')
+    z_m6 = _zscore('m6_nuke')
+
+    # 异常共振条件：M1 资金极度离群、M2 成交额极度萎缩、M6 核按钮异常飙升
+    cond_m1 = z_m1 < -ENERGY_Z_THRESH
+    cond_m2 = z_m2 < -ENERGY_Z_THRESH
+    cond_m6 = z_m6 > ENERGY_Z_THRESH
+
+    # 统计每日日常异常个数
+    anomaly_count = (cond_m1.astype(int) +
+                     cond_m2.astype(int) +
+                     cond_m6.astype(int))
+
+    # 简化版系统共振：最近 20 日内，这三个指标的 Z-Score 同号天数较多视为相关性抬升
+    same_sign = ((np.sign(z_m1) == np.sign(z_m2)) &
+                 (np.sign(z_m1) == np.sign(z_m6)))
+    sys_reson = same_sign.rolling(20, min_periods=10).mean() > 0.7
+
+    is_anomaly = (anomaly_count >= 3) | (sys_reson & (anomaly_count >= 2))
+
+    # 连续能量累加
+    scores = df['total_score'].fillna(method='ffill')
+    roll_mean = scores.rolling(ENERGY_ROLL_MEAN_DAYS,
+                               min_periods=max(10, ENERGY_ROLL_MEAN_DAYS // 2)).mean().shift(1)
+    # 不足窗口时，用整体均值兜底
+    global_mean = scores.mean()
+    roll_mean = roll_mean.fillna(global_mean)
+
+    energy = []
+    reset_flags = []
+    s_prev = 0.0
+    in_reset = False
+
+    for day, row in df.iterrows():
+        score_today = row['total_score']
+        neutral = roll_mean.loc[day]
+        delta = score_today - neutral
+        if delta < 0:
+            delta *= ENERGY_NEG_WEIGHT
+
+        # 冰点重置逻辑
+        if bool(is_anomaly.loc[day]):
+            s_t = 0.0
+            in_reset = True
+            reset_today = True
+        else:
+            if in_reset:
+                # 刚脱离异常区，重置起点为 0
+                s_prev = 0.0
+                in_reset = False
+            # 自适应衰减：能量越高，衰减越强
+            s_base = max(s_prev, 0.0)
+            decay = ENERGY_BASE_DECAY * (1.0 + s_base / ENERGY_CAP)
+            decay = min(max(decay, 0.0), 0.95)
+            s_t = s_prev * (1.0 - decay) + delta
+            reset_today = False
+
+        energy.append(s_t)
+        reset_flags.append(reset_today)
+        s_prev = s_t
+
+    df['energy_index'] = energy
+    df['energy_reset'] = reset_flags
+
+    df = df.reset_index()
+    return df

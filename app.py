@@ -2943,9 +2943,59 @@ def api_market_sentiment_score():
             except Exception:
                 pass
         from data_fetcher import JuyuanDataFetcher
-        from market_sentiment import compute_daily_sentiment
+        from market_sentiment import compute_daily_sentiment, compute_energy_index_series
         fetcher = JuyuanDataFetcher(lazy_init_pool=True)
         result = compute_daily_sentiment(trading_day, fetcher)
+
+        # 计算连续能量指数：基于历史结果 + 当日结果
+        try:
+            import pandas as _pd
+            import json as _j_energy
+            conn_h = sqlite3.connect('database.db')
+            ch = conn_h.cursor()
+            ch.execute(
+                "SELECT trading_day, result_json FROM market_sentiment_results "
+                "WHERE trading_day < ? ORDER BY trading_day",
+                (trading_day,)
+            )
+            rows = ch.fetchall()
+            conn_h.close()
+            records = []
+            for td, rj in rows:
+                try:
+                    d = _j_energy.loads(rj)
+                except Exception:
+                    continue
+                m1 = d.get('module1') or {}
+                m2 = d.get('module2') or {}
+                m6 = d.get('module6') or {}
+                records.append({
+                    'trading_day': td,
+                    'total_score': d.get('total_score'),
+                    'm1_mfr': m1.get('money_flow_ratio'),
+                    'm2_turnover': m2.get('turnover_today'),
+                    'm6_nuke': m6.get('nuke_ratio'),
+                })
+            # 加上今日
+            m1r = (result.get('module1') or {})
+            m2r = (result.get('module2') or {})
+            m6r = (result.get('module6') or {})
+            records.append({
+                'trading_day': trading_day,
+                'total_score': result.get('total_score'),
+                'm1_mfr': m1r.get('money_flow_ratio'),
+                'm2_turnover': m2r.get('turnover_today'),
+                'm6_nuke': m6r.get('nuke_ratio'),
+            })
+            df_hist = _pd.DataFrame.from_records(records)
+            if not df_hist.empty:
+                df_energy = compute_energy_index_series(df_hist)
+                last_row = df_energy.sort_values('trading_day').iloc[-1]
+                result['energy_index'] = float(last_row.get('energy_index', 0.0) or 0.0)
+                result['energy_reset'] = bool(last_row.get('energy_reset', False))
+        except Exception as _e_energy:
+            logging.error(f'计算连续能量指数失败: {_e_energy}', exc_info=True)
+
         try:
             conn = sqlite3.connect('database.db')
             c = conn.cursor()
